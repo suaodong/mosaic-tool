@@ -1,0 +1,16 @@
+# pyproject.toml (Python - Poetry)
+[tool.poetry]
+name = "mosaic-tool"
+version = "0.1.0"
+description = "极简图片打码工具：本地图片马赛克 / 高斯模糊打码（PyQt6 + Pillow）"
+authors = ["2827275325@qq.com"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.12.10"
+pyqt6 = "^6.12.1"
+pillow = "^13.0.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
