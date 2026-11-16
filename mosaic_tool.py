@@ -1,15 +1,16 @@
 """极简图片打码工具
 
-打开本地图片后，按住鼠标左键拖拽框选区域，松开即对选区打码；
-支持马赛克 / 高斯模糊两种方式、强度调节、撤销与保存。
+打开本地图片或 PDF，按住鼠标左键拖拽框选区域，松开即对选区打码；
+支持马赛克 / 高斯模糊两种方式、强度调节、撤销；
+「保存 / 导出」按钮下拉直接选择格式：PNG / JPEG / BMP / WEBP / TIFF / PDF。
 纯本地运行，无需联网。
 """
 
 from __future__ import annotations
 
-import os
 import sys
 
+import pypdfium2 as pdfium
 from PIL import Image, ImageFilter
 from PyQt6.QtCore import QPoint, QRect, Qt, pyqtSignal
 from PyQt6.QtGui import (
@@ -28,12 +29,27 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QSlider,
     QVBoxLayout,
     QWidget,
 )
+
+PDF_RENDER_DPI = 200  # PDF 页面渲染清晰度（同时作为导出 PDF 的页面分辨率）
+
+# 可导出的格式：(格式键, 菜单显示名, 文件对话框过滤器)
+SAVE_FORMATS = [
+    ("png",  "PNG 图片",  "PNG 图片 (*.png)"),
+    ("jpg",  "JPEG 图片", "JPEG 图片 (*.jpg *.jpeg)"),
+    ("bmp",  "BMP 位图",  "BMP 位图 (*.bmp)"),
+    ("webp", "WEBP 图片", "WEBP 图片 (*.webp)"),
+    ("tif",  "TIFF 图片", "TIFF 图片 (*.tif *.tiff)"),
+    ("pdf",  "PDF 文档",  "PDF 文档 (*.pdf)"),
+]
+# 各格式可接受的扩展名（用户手动输入时识别）
+EXT_VARIANTS = {"jpg": (".jpg", ".jpeg"), "tif": (".tif", ".tiff")}
 
 
 class ImageLabel(QLabel):
@@ -48,8 +64,8 @@ class ImageLabel(QLabel):
         super().__init__()
         self._image: Image.Image | None = None  # 原图（PIL）
         self._scaled: QPixmap | None = None     # 当前窗口尺寸下的缩放缓存
-        self._draw_rect = QRect()            # 缩放图在 label 内的居中绘制区域
-        self._layout_key = None              # 缩放缓存的有效性标识
+        self._draw_rect = QRect()               # 缩放图在 label 内的居中绘制区域
+        self._layout_key = None                 # 缩放缓存的有效性标识
         self._drag_start: QPoint | None = None
         self._drag_end: QPoint | None = None
         self.setMinimumSize(200, 150)
@@ -142,7 +158,8 @@ class ImageLabel(QLabel):
         if self._image is None:
             painter.setPen(QColor("#888888"))
             painter.drawText(
-                self.rect(), Qt.AlignmentFlag.AlignCenter, "请点击上方按钮打开图片"
+                self.rect(), Qt.AlignmentFlag.AlignCenter,
+                "请点击上方按钮打开图片或 PDF 文件",
             )
         else:
             draw_rect = self._layout()
@@ -173,10 +190,15 @@ class MosaicTool(QMainWindow):
         self.setWindowTitle("极简图片打码工具")
         self.resize(800, 600)
 
-        self.image: Image.Image | None = None  # 当前图像（PIL，打码直接作用于它）
-        self.history: list[Image.Image] = []   # 撤销栈
+        self.pages: list[Image.Image] = []  # 全部页面（普通图片 = 单页）
+        self.page_index = 0                 # 当前页码
+        self.history: list[tuple[int, Image.Image]] = []  # (页码, 打码前该页副本)
 
         self._init_ui()
+
+    @property
+    def current_image(self) -> Image.Image | None:
+        return self.pages[self.page_index] if self.pages else None
 
     def _init_ui(self):
         central = QWidget()
@@ -185,8 +207,8 @@ class MosaicTool(QMainWindow):
 
         # 顶部工具区
         bar = QHBoxLayout()
-        self.btn_open = QPushButton("打开图片")
-        self.btn_save = QPushButton("保存图片")
+        self.btn_open = QPushButton("打开文件")
+        self.btn_save = QPushButton("保存 / 导出")
         self.btn_clear = QPushButton("清除选区")
         self.btn_undo = QPushButton("撤销")
         self.mode_combo = QComboBox()
@@ -196,6 +218,11 @@ class MosaicTool(QMainWindow):
         self.strength_slider.setValue(10)
         self.strength_slider.setFixedWidth(140)
         self.strength_label = QLabel("强度: 10")
+
+        # 翻页导航（仅多页 PDF 时显示）
+        self.btn_prev = QPushButton("◀ 上一页")
+        self.page_label = QLabel("1 / 1")
+        self.btn_next = QPushButton("下一页 ▶")
 
         bar.addWidget(self.btn_open)
         bar.addWidget(self.btn_save)
@@ -208,93 +235,150 @@ class MosaicTool(QMainWindow):
         bar.addWidget(self.strength_slider)
         bar.addWidget(self.strength_label)
         bar.addStretch(1)
+        bar.addWidget(self.btn_prev)
+        bar.addWidget(self.page_label)
+        bar.addWidget(self.btn_next)
         layout.addLayout(bar)
 
         # 图片显示区
         self.image_label = ImageLabel()
         layout.addWidget(self.image_label, stretch=1)
 
+        # 「保存 / 导出」下拉菜单：直接选择输出格式
+        save_menu = QMenu(self)
+        for fmt, title, _filter in SAVE_FORMATS:
+            action = save_menu.addAction(f"{title} (.{fmt})")
+            action.triggered.connect(
+                lambda checked=False, f=fmt: self.save_as(f)
+            )
+        self.btn_save.setMenu(save_menu)
+
         # 事件绑定
-        self.btn_open.clicked.connect(self.open_image)
-        self.btn_save.clicked.connect(self.save_image)
+        self.btn_open.clicked.connect(self.open_file)
         self.btn_clear.clicked.connect(self.image_label.clear_selection)
         self.btn_undo.clicked.connect(self.undo)
+        self.btn_prev.clicked.connect(lambda: self._goto_page(self.page_index - 1))
+        self.btn_next.clicked.connect(lambda: self._goto_page(self.page_index + 1))
         self.strength_slider.valueChanged.connect(
             lambda v: self.strength_label.setText(f"强度: {v}")
         )
         self.image_label.selectionMade.connect(self.apply_redaction)
 
         self._update_buttons()
+        self._update_page_nav()
 
     def _update_buttons(self):
-        self.btn_save.setEnabled(self.image is not None)
+        self.btn_save.setEnabled(bool(self.pages))
         self.btn_undo.setEnabled(bool(self.history))
 
-    # ---------- 打开 / 保存 ----------
-    def open_image(self):
+    # ---------- 打开 ----------
+    def open_file(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "选择图片", "", "Images (*.png *.jpg *.jpeg *.bmp)"
+            self,
+            "选择图片或 PDF",
+            "",
+            "所有支持 (*.png *.jpg *.jpeg *.bmp *.pdf);;"
+            "图片 (*.png *.jpg *.jpeg *.bmp);;PDF 文档 (*.pdf)",
         )
         if not path:
             return
         try:
-            self.image = Image.open(path).convert("RGB")
+            if path.lower().endswith(".pdf"):
+                pages = self._load_pdf(path)
+            else:
+                pages = [Image.open(path).convert("RGB")]
         except Exception as exc:
-            QMessageBox.warning(self, "打开失败", f"无法打开图片：\n{exc}")
+            QMessageBox.warning(self, "打开失败", f"无法打开文件：\n{exc}")
             return
+        if not pages:
+            QMessageBox.warning(self, "打开失败", "该 PDF 中没有页面。")
+            return
+        self.pages = pages
+        self.page_index = 0
         self.history.clear()
         self._refresh_display()
         self._update_buttons()
 
-    def save_image(self):
-        if self.image is None:
+    @staticmethod
+    def _load_pdf(path: str) -> list[Image.Image]:
+        """将 PDF 的每一页渲染为 RGB 图片（保留全部页面，供逐页打码）。"""
+        doc = pdfium.PdfDocument(path)
+        try:
+            pages = []
+            for i in range(len(doc)):
+                page = doc[i]
+                bitmap = page.render(scale=PDF_RENDER_DPI / 72)
+                pages.append(bitmap.to_pil().convert("RGB"))
+                page.close()
+            return pages
+        finally:
+            doc.close()
+
+    # ---------- 翻页 ----------
+    def _goto_page(self, idx: int):
+        if 0 <= idx < len(self.pages) and idx != self.page_index:
+            self.page_index = idx
+            self._refresh_display()
+
+    def _update_page_nav(self):
+        n = len(self.pages)
+        multi = n > 1
+        self.btn_prev.setVisible(multi)
+        self.page_label.setVisible(multi)
+        self.btn_next.setVisible(multi)
+        self.page_label.setText(f"{self.page_index + 1} / {n}")
+        self.btn_prev.setEnabled(self.page_index > 0)
+        self.btn_next.setEnabled(self.page_index < n - 1)
+
+    # ---------- 保存 ----------
+    def save_as(self, fmt: str):
+        """以指定格式导出（由保存按钮的下拉菜单触发）。"""
+        if self.current_image is None:
             return
-        filters = (
-            "PNG 图片 (*.png);;"
-            "JPEG 图片 (*.jpg *.jpeg);;"
-            "BMP 位图 (*.bmp);;"
-            "WEBP 图片 (*.webp);;"
-            "TIFF 图片 (*.tif *.tiff)"
-        )
-        path, selected = QFileDialog.getSaveFileName(
-            self, "保存图片", "output.png", filters
+        title, filt = next((t, f) for k, t, f in SAVE_FORMATS if k == fmt)
+        path, _ = QFileDialog.getSaveFileName(
+            self, f"保存为 {title}", f"output.{fmt}", filt
         )
         if not path:
             return
-        path = self._resolve_save_path(path, selected)
+        path = self._ensure_ext(path, fmt)
         try:
-            if path.lower().endswith((".jpg", ".jpeg")):
-                self.image.save(path, quality=95)
-            else:
-                self.image.save(path)
+            self._save_to_path(path, fmt)
         except Exception as exc:
-            QMessageBox.warning(self, "保存失败", f"无法保存图片：\n{exc}")
+            QMessageBox.warning(self, "保存失败", f"无法保存文件：\n{exc}")
             return
-        QMessageBox.information(self, "保存成功", f"图片已保存到：\n{path}")
+        note = ""
+        if fmt != "pdf" and len(self.pages) > 1:
+            note = "\n（提示：多页文档导出为图片格式时仅保存当前页）"
+        QMessageBox.information(self, "保存成功", f"文件已保存到：\n{path}{note}")
 
     @staticmethod
-    def _resolve_save_path(path: str, selected_filter: str) -> str:
-        """用户未输入扩展名时，按所选的格式过滤器补全扩展名。"""
-        if os.path.splitext(path)[1]:
-            return path
-        ext_map = [
-            ("PNG", ".png"),
-            ("JPEG", ".jpg"),
-            ("BMP", ".bmp"),
-            ("WEBP", ".webp"),
-            ("TIFF", ".tif"),
-        ]
-        for key, ext in ext_map:
-            if key in selected_filter:
-                return path + ext
-        return path + ".png"
+    def _ensure_ext(path: str, fmt: str) -> str:
+        """用户未输入扩展名时，按所选格式补全。"""
+        if not path.lower().endswith(EXT_VARIANTS.get(fmt, (f".{fmt}",))):
+            path += f".{fmt}"
+        return path
+
+    def _save_to_path(self, path: str, fmt: str):
+        if fmt == "pdf":
+            # 多页重新组装：打码页替换原页，总页数不丢失
+            first, rest = self.pages[0], self.pages[1:]
+            first.save(
+                path, "PDF", save_all=True, append_images=rest,
+                resolution=float(PDF_RENDER_DPI),
+            )
+        elif fmt == "jpg":
+            self.current_image.save(path, quality=95)
+        else:
+            self.current_image.save(path)
 
     # ---------- 打码 / 撤销 ----------
     def apply_redaction(self, rect: QRect):
-        """对【原图坐标】下的 rect 区域打码（马赛克或高斯模糊）。"""
-        if self.image is None:
+        """对当前页【原图坐标】下的 rect 区域打码（马赛克或高斯模糊）。"""
+        img = self.current_image
+        if img is None:
             return
-        img_w, img_h = self.image.size
+        img_w, img_h = img.size
         x1, y1 = max(0, rect.x()), max(0, rect.y())
         x2 = min(img_w, rect.x() + rect.width())
         y2 = min(img_h, rect.y() + rect.height())
@@ -303,7 +387,7 @@ class MosaicTool(QMainWindow):
 
         self._push_history()
 
-        region = self.image.crop((x1, y1, x2, y2))
+        region = img.crop((x1, y1, x2, y2))
         strength = self.strength_slider.value()
         if self.mode_combo.currentIndex() == self.MODE_MOSAIC:
             # 先极度缩小丢失细节，再用最近邻放大回块状的“马赛克”效果
@@ -315,25 +399,29 @@ class MosaicTool(QMainWindow):
         else:
             region = region.filter(ImageFilter.GaussianBlur(radius=strength))
 
-        self.image.paste(region, (x1, y1))
+        img.paste(region, (x1, y1))
         self._refresh_display()
         self._update_buttons()
 
     def undo(self):
         if not self.history:
             return
-        self.image = self.history.pop()
+        idx, img = self.history.pop()
+        self.pages[idx] = img
+        self.page_index = idx
         self._refresh_display()
         self._update_buttons()
 
     def _push_history(self):
-        self.history.append(self.image.copy())
+        self.history.append((self.page_index, self.current_image.copy()))
         if len(self.history) > self.MAX_HISTORY:
             self.history.pop(0)
 
     # ---------- 显示刷新 ----------
     def _refresh_display(self):
-        self.image_label.set_image(self.image)
+        if self.current_image is not None:
+            self.image_label.set_image(self.current_image)
+        self._update_page_nav()
 
 
 if __name__ == "__main__":
